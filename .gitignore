@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Docker
+*.pid
+*.sock
+*.db
+mlruns/
+
+# System
+.DS_Store
+
+# venv
+synt/
+
+# main_scripy
+main_srpt.py
+
+# demo_script.py
+demo_srp.py
+
+# demo_results
+demo_results/
+

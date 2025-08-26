@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # Main API service
+  synthetic-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./synthetic-lm-pipeline:/app/synthetic-lm-pipeline
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+      - MLFLOW_TRACKING_URI=file:///app/synthetic-lm-pipeline/mlruns
+    networks:
+      - synthetic-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MLflow tracking server
+  mlflow-server:
+    image: python:3.9-slim
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./synthetic-lm-pipeline/mlruns:/mlruns
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=file:///mlruns
+    command: >
+      bash -c "pip install mlflow[extras] &&
+               mlflow server 
+               --backend-store-uri file:///mlruns 
+               --default-artifact-root file:///mlruns
+               --host 0.0.0.0 
+               --port 5000"
+    networks:
+      - synthetic-network
+    restart: unless-stopped
+
+networks:
+  synthetic-network:
+    driver: bridge
