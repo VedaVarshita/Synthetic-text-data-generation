@@ -23,7 +23,7 @@ class LoRAConfig:
 
 @dataclass
 class GenConfig:
-    model_name: str = "meta-llama/Llama-2-13b-hf"
+    model_name: str = "meta-llama/Llama-3.2-3B"
     device: str = "auto"
     max_new_tokens: int = 128
     temperature: float = 0.8   # τ_g in the papers
@@ -168,7 +168,7 @@ class Config:
         with open(config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
         
-        print(f"✅ Configuration saved to {config_path}")
+        print(f"Configuration saved to {config_path}")
 
 class MetadataDB:
     """SQLite database for tracking pipeline metadata"""
@@ -298,7 +298,7 @@ def setup_logging(logs_dir: Path, log_level: Union[str, int] = "INFO") -> loggin
 
 def initialize_project():
     """Initialize the complete project setup"""
-    print("🚀 Initializing Synthetic Language Data Pipeline...")
+    print("Initializing Synthetic Language Data Pipeline...")
     
     # Initialize configuration
     config = Config()
@@ -321,14 +321,14 @@ def initialize_project():
     except ImportError:
         logger.warning("MLflow not available")
     
-    print("✅ Project initialization complete!")
+    print(" Project initialization complete!")
     return config, db, logger
 
 if __name__ == "__main__":
     # Initialize project when run directly
     config, db, logger = initialize_project()
     
-    print(f"📁 Project structure:")
+    print(f" Project structure:")
     print(f"   Base directory: {config.base_dir}")
     print(f"   Data directory: {config.data_dir}")
     print(f"   Models directory: {config.models_dir}")

@@ -1,0 +1,8 @@
+[
+    {
+      "prompt": "You are an IMDB movie reviewer. Write a concise positive review.\n- Be specific about acting, direction, pacing, and craft without spoilers.\n- Do not state the word 'positive' or give a numeric rating.\n- Length: 80–140 words.\n\n### Task:\nWrite one positive movie review."
+    },
+    {
+      "prompt": "You are an IMDB movie reviewer. Write a concise negative review.\n- Provide concrete critiques (e.g., pacing, dialogue, structure) without insults or spoilers.\n- Do not state the word 'negative' or give a numeric rating.\n- Length: 80–140 words.\n\n### Task:\nWrite one negative movie review."
+    }
+  ]

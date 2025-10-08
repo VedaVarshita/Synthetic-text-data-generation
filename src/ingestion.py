@@ -169,6 +169,28 @@ class DataIngestion:
         if max_samples is not None:
             items = items[:max_samples]
         return items
+    def _load_hf_agnews_imdb(
+        self,
+        dataset_id: str,
+        max_samples: Optional[int] = None,
+    ) -> List[str]:
+        """
+        Load AG News or IMDB from Hugging Face and return a list of raw texts (train split).
+        """
+
+        from datasets import load_dataset
+        # default split to train
+        ds = load_dataset(dataset_id, split="train")
+        texts: List[str] = []
+        count = 0
+        for row in ds:
+            t = (row.get("text") or "").strip()
+            if t:
+                texts.append(t)
+                count += 1
+                if max_samples and count >= max_samples:
+                    break
+        return texts
 
     
     def load_custom_text_file(self, file_path: Union[str, Path]) -> List[str]:
@@ -411,59 +433,221 @@ class DataIngestion:
             logger.info(f"[MLflow] Logged ingestion for {dataset_name}:{version} to {uri}")
 
     
+    def _load_local_texts(
+        self,
+        source_path: str,
+        max_samples: Optional[int] = None,
+        ) -> List[str]:
+        """
+        Load texts from a local path. Supports:
+        - A single file (delegates to `self.load_custom_text_file`)
+        - A folder containing 'train.*' or any text files (will concatenate)
+        """
+        p = Path(source_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Local source_path not found: {source_path}")
+
+        texts: List[str] = []
+
+        if p.is_file():
+            texts = self.load_custom_text_file(str(p))
+        else:
+            # naive folder loader:
+            # - prefer train.* file if present
+            # - otherwise load all *.txt / *.jsonl via your loader
+            candidates = []
+            train_like = list(p.glob("train.*"))
+            if train_like:
+                candidates = train_like
+            else:
+                candidates = list(p.glob("*.txt")) + list(p.glob("*.jsonl")) + list(p.glob("*.json"))
+
+            for fp in candidates:
+                try:
+                    texts.extend(self.load_custom_text_file(str(fp)))
+                except Exception:
+                    # best-effort; skip files that your loader can't parse
+                    continue
+
+        # cap to max_samples if requested
+        if max_samples is not None and len(texts) > max_samples:
+            texts = texts[:max_samples]
+        return texts
+
+    # def run_ingestion_pipeline(
+    #     self,
+    #     source_type: str = "huggingface",
+    #     source_path: str = "wikitext",
+    #     dataset_name: str = "sample_text",
+    #     version: str = "v1",
+    #     max_samples: int = 1000,
+    #     # allow explicit ratios if your create_dataset_splits accepts them
+    #     train_ratio: float = 0.8,
+    #     val_ratio: float = 0.1,
+    #     test_ratio: float = 0.1,
+    # ) -> Dict[str, Path]:
+    #     """
+    #     Unified entry point used by Prefect flows.
+    #     Routes AG News/IMDB to the unified loader; everything else to generic loaders.
+    #     Then: clean -> split -> save -> log.
+    #     Returns dict of split -> file paths.
+    #     """
+    #     import logging
+    #     logger = logging.getLogger(__name__)
+    #     logger.info("Starting data ingestion pipeline...")
+
+    #     try:
+    #         src = (source_path or "").lower()
+
+    #         # 1) Load --------------------------------------------------------------
+    #         if source_type == "huggingface" and src in {"ag_news", "imdb"}:
+    #             # Use your unified path that returns {"train":[UnifiedItem], "test":[...], ...}
+    #             # NOTE: implement self.load_unified(dataset_name: str, max_total: Optional[int]) -> Dict[str, List[UnifiedItem]]
+    #             splits, _label_map = load_unified(src, limit_seed=max_samples)
+    #             train_items = splits.get("train", [])
+    #             texts: List[str] = [u.text for u in train_items if getattr(u, "text", "").strip()]
+
+    #         elif source_type == "file":
+    #             # Your existing file loader: returns List[str]
+    #             texts = self.load_custom_text_file(source_path)
+
+    #         elif source_type == "huggingface":
+    #             # Generic HF datasets (e.g., wikitext). Make sure your load_sample_dataset accepts config_name=None.
+
+    #             dataset = self.load_sample_dataset(
+    #                 dataset_name=source_path,
+    #                 config_name=None,
+    #                 split="train",
+    #                 max_samples=max_samples,
+    #             )
+    #             texts = [row.get("text", "").strip() for row in dataset if row.get("text")]
+    #         if source_type == "huggingface":
+    #             hf_id = (source_path or ds_kind).lower().strip()
+    #             texts = [self._load_hf_agnews_imdb(hf_id, max_samples=max_samples)]
+    #             texts = [self._load_local_texts(source_path, max_samples=max_samples)]
+
+    #         else:
+    #             raise ValueError(f"Unsupported source type: {source_type}")
+
+    #         # 2) Clean & validate --------------------------------------------------
+    #         # Provide either clean_and_validate_text or fallback to your clean_texts + drop empties
+    #         if hasattr(self, "clean_and_validate_text"):
+    #             cleaned_texts = self.clean_and_validate_text(texts)
+    #         else:
+    #             cleaned = self.clean_texts(texts)
+    #             cleaned_texts = [t for t in cleaned if t and t.strip()]
+
+    #         if not cleaned_texts:
+    #             raise ValueError("No valid texts after cleaning!")
+
+    #         # 3) Split -------------------------------------------------------------
+    #         # If your create_dataset_splits signature accepts ratios, pass them; otherwise call without.
+    #         try:
+    #             data_splits = self.create_dataset_splits(
+    #                 cleaned_texts,
+    #                 train_ratio=train_ratio,
+    #                 val_ratio=val_ratio,
+    #                 test_ratio=test_ratio,
+    #             )
+    #         except TypeError:
+    #             # fallback for older signature
+    #             data_splits = self.create_dataset_splits(cleaned_texts)
+
+    #         # 4) Save --------------------------------------------------------------
+    #         saved_paths = self.save_processed_data(data_splits, dataset_name, version)
+
+    #         # 5) Log to MLflow -----------------------------------------------------
+    #         try:
+    #             self.log_to_mlflow(data_splits, dataset_name, version)
+    #         except Exception:
+    #             logger.debug("MLflow logging skipped or failed; continuing.")
+
+    #         logger.info("Data ingestion pipeline completed successfully.")
+    #         # Ensure we return {split: Path}
+    #         return {k: (Path(v) if not isinstance(v, Path) else v) for k, v in saved_paths.items()}
+
+    #     except Exception as e:
+    #         logger.error(f"Data ingestion pipeline failed: {e}")
+    #         raise
+
+    def _format_for_training(self, texts: List[str], dataset_kind: str) -> List[str]:
+        """
+        Format raw AG News/IMDB texts as instruction-response pairs
+        matching the generation prompt template.
+        """
+        from src.ingestion import load_unified, LABEL_MAPS
+        
+        # Reload with labels
+        splits, label_map = load_unified(dataset_kind, limit_seed=None)
+        train_items = splits.get("train", [])
+        
+        formatted_texts = []
+        for item in train_items[:len(texts)]:
+            label_name = label_map[item.label]
+            
+            # Use the EXACT template from flows.py
+            instruction = (
+                "Now you are a journalist writing news articles. You are given a topic and must write a "
+                "corresponding news article for it. You are also given a length requirement. You must "
+                "ensure your news meets the length requirement.\n\n"
+                f"Can you write a news report with the topic {label_name}? The length requirement is: "
+                "50 words. Please be creative and write unique news articles."
+            )
+            
+            # Format as instruction + response
+            formatted = f"{instruction}\n\n{item.text}"
+            formatted_texts.append(formatted)
+        
+        return formatted_texts
 
     def run_ingestion_pipeline(
         self,
-        source_type: str = "huggingface",
-        source_path: str = "wikitext",
-        dataset_name: str = "sample_text",
+        source_type: str = "huggingface",     # "huggingface" | "file"
+        source_path: Optional[str] = None,    # HF dataset id or local path; if None, inferred from dataset_name
+        dataset_name: str = "ag_news",        # "ag_news" | "imdb"
         version: str = "v1",
         max_samples: int = 1000,
-        # allow explicit ratios if your create_dataset_splits accepts them
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
+        format_for_instruction_tuning: bool = True,
     ) -> Dict[str, Path]:
         """
         Unified entry point used by Prefect flows.
-        Routes AG News/IMDB to the unified loader; everything else to generic loaders.
-        Then: clean -> split -> save -> log.
-        Returns dict of split -> file paths.
+
+        Modes:
+          - HuggingFace: pulls 'ag_news' or 'imdb' -> takes 'train' split texts
+          - File: loads from local 'source_path' (file or folder). Your `load_custom_text_file`
+                  is used under the hood.
+
+        Returns: Dict of split -> saved file Path (e.g., {'train': Path(...), 'validation': Path(...), 'test': Path(...)}).
         """
         import logging
         logger = logging.getLogger(__name__)
         logger.info("Starting data ingestion pipeline...")
 
         try:
-            src = (source_path or "").lower()
+            # Normalize desired dataset (we only allow these two)
+            ds_kind = (dataset_name or "").lower().strip()
+            texts: List[str] = []
 
-            # 1) Load --------------------------------------------------------------
-            if source_type == "huggingface" and src in {"ag_news", "imdb"}:
-                # Use your unified path that returns {"train":[UnifiedItem], "test":[...], ...}
-                # NOTE: implement self.load_unified(dataset_name: str, max_total: Optional[int]) -> Dict[str, List[UnifiedItem]]
-                splits, _label_map = load_unified(src, limit_seed=max_samples)
-                train_items = splits.get("train", [])
-                texts: List[str] = [u.text for u in train_items if getattr(u, "text", "").strip()]
+            # -----------------------------
+            # 1) LOAD
+            # -----------------------------
+            if source_type == "huggingface":
+                # If source_path omitted, use dataset_name as HF id
+                hf_id = (source_path or ds_kind).lower().strip()
+                texts = self._load_hf_agnews_imdb(hf_id, max_samples=max_samples)
 
             elif source_type == "file":
-                # Your existing file loader: returns List[str]
-                texts = self.load_custom_text_file(source_path)
-
-            elif source_type == "huggingface":
-                # Generic HF datasets (e.g., wikitext). Make sure your load_sample_dataset accepts config_name=None.
-                dataset = self.load_sample_dataset(
-                    dataset_name=source_path,
-                    config_name=None,
-                    split="train",
-                    max_samples=max_samples,
-                )
-                texts = [row.get("text", "").strip() for row in dataset if row.get("text")]
+                texts = self._load_local_texts(source_path, max_samples=max_samples)
 
             else:
-                raise ValueError(f"Unsupported source type: {source_type}")
+                raise ValueError(f"Unsupported source_type: {source_type}")
 
-            # 2) Clean & validate --------------------------------------------------
-            # Provide either clean_and_validate_text or fallback to your clean_texts + drop empties
+            # -----------------------------
+            # 2) CLEAN & VALIDATE
+            # -----------------------------
             if hasattr(self, "clean_and_validate_text"):
                 cleaned_texts = self.clean_and_validate_text(texts)
             else:
@@ -472,32 +656,50 @@ class DataIngestion:
 
             if not cleaned_texts:
                 raise ValueError("No valid texts after cleaning!")
+            
+            if format_for_instruction_tuning and source_type == "huggingface":
+                texts = self._format_for_training(cleaned_texts, dataset_name)
 
-            # 3) Split -------------------------------------------------------------
-            # If your create_dataset_splits signature accepts ratios, pass them; otherwise call without.
+            # -----------------------------
+            # 3) SPLIT
+            # -----------------------------
             try:
                 data_splits = self.create_dataset_splits(
-                    cleaned_texts,
+                    texts,
                     train_ratio=train_ratio,
                     val_ratio=val_ratio,
                     test_ratio=test_ratio,
                 )
             except TypeError:
-                # fallback for older signature
-                data_splits = self.create_dataset_splits(cleaned_texts)
+                data_splits = self.create_dataset_splits(texts)
 
-            # 4) Save --------------------------------------------------------------
+            # -----------------------------
+            # 4) SAVE
+            # -----------------------------
             saved_paths = self.save_processed_data(data_splits, dataset_name, version)
+            # normalize keys (some code uses 'val', some 'validation')
+            key_map = {
+                "val": "validation",
+                "valid": "validation",
+                "validation": "validation",
+                "train": "train",
+                "test": "test",
+            }
+            normalized_saved = {}
+            for k, v in saved_paths.items():
+                nk = key_map.get(k, k)
+                normalized_saved[nk] = (Path(v) if not isinstance(v, Path) else v)
 
-            # 5) Log to MLflow -----------------------------------------------------
+            # -----------------------------
+            # 5) LOG TO MLFLOW (best-effort)
+            # -----------------------------
             try:
                 self.log_to_mlflow(data_splits, dataset_name, version)
             except Exception:
                 logger.debug("MLflow logging skipped or failed; continuing.")
 
             logger.info("Data ingestion pipeline completed successfully.")
-            # Ensure we return {split: Path}
-            return {k: (Path(v) if not isinstance(v, Path) else v) for k, v in saved_paths.items()}
+            return normalized_saved
 
         except Exception as e:
             logger.error(f"Data ingestion pipeline failed: {e}")

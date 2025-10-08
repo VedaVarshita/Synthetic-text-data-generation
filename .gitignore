@@ -33,3 +33,13 @@ demo_srp.py
 # demo_results
 demo_results/
 
+#src/
+src/validate_2.py
+
+bitsandbytes/
+data/
+models/
+reports/
+run_flow.sh
+run_serve.sh
+tests/

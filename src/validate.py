@@ -1,7 +1,7 @@
 # src/validate.py
 """
 Comprehensive validation module for synthetic text data.
-Includes quality, diversity, privacy, and similarity checks.
+Includes quality, diversity, privacy, and similarity checks with enhanced metrics.
 """
 
 import os
@@ -19,9 +19,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import mlflow
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from nltk.util import ngrams
+from rouge_score import rouge_scorer
 import re
 
 # Download required NLTK data
@@ -33,13 +35,73 @@ except LookupError:
 logger = logging.getLogger(__name__)
 
 
-from typing import List, Dict
-# Simple quality metrics + optional DCScore
+def vendiscore(embeddings: np.ndarray, k: int = None) -> float:
+    """
+    Calculate VendiScore - a diversity metric based on eigenvalues of similarity matrix
+    Higher scores indicate more diversity
+    
+    Args:
+        embeddings: Array of shape (n_samples, embedding_dim)
+        k: Number of nearest neighbors to consider (default: sqrt(n_samples))
+    
+    Returns:
+        VendiScore value
+    """
+    n_samples = embeddings.shape[0]
+    if n_samples < 2:
+        return 0.0
+    
+    if k is None:
+        k = max(1, int(np.sqrt(n_samples)))
+    
+    # Normalize embeddings
+    embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10)
+    
+    # Compute similarity matrix
+    similarity_matrix = np.dot(embeddings_norm, embeddings_norm.T)
+    
+    # Create kernel matrix from k-NN similarities
+    kernel_matrix = np.zeros((n_samples, n_samples))
+    
+    for i in range(n_samples):
+        # Get k+1 most similar (including self)
+        similar_indices = np.argsort(similarity_matrix[i])[::-1]
+        # Take k neighbors (excluding self if it's the most similar)
+        if similar_indices[0] == i and len(similar_indices) > 1:
+            neighbors = similar_indices[1:k+1]
+        else:
+            neighbors = similar_indices[:k]
+        
+        for j in neighbors:
+            if j < n_samples:
+                kernel_matrix[i][j] = similarity_matrix[i][j]
+    
+    # Make symmetric
+    kernel_matrix = (kernel_matrix + kernel_matrix.T) / 2
+    
+    # Compute eigenvalues
+    try:
+        eigenvals = np.linalg.eigvals(kernel_matrix)
+        eigenvals = np.real(eigenvals[eigenvals > 1e-10])  # Keep only positive eigenvalues
+        
+        if len(eigenvals) == 0:
+            return 0.0
+        
+        # Normalize eigenvalues to get probability distribution
+        eigenvals = eigenvals / np.sum(eigenvals)
+        
+        # Compute VendiScore as exponential of Shannon entropy
+        entropy = -np.sum(eigenvals * np.log(eigenvals + 1e-10))
+        vendi_score = np.exp(entropy)
+        
+        return float(vendi_score)
+    except:
+        return 0.0
+
 
 def dcscore(texts: List[str], embedder_name: str = "princeton-nlp/unsup-simcse-bert-base-uncased", temperature: float = 1.0) -> float:
     """
     DCScore: compute embeddings -> cosine similarity matrix -> softmax row-wise with temperature -> sum diagonal.
-    Install deps: pip install sentence-transformers torch
     """
     try:
         from sentence_transformers import SentenceTransformer
@@ -56,49 +118,173 @@ def dcscore(texts: List[str], embedder_name: str = "princeton-nlp/unsup-simcse-b
         score = torch.trace(P).item()
     return float(score)
 
-def distinct_n(texts: List[str], n: int = 2) -> float:
-    ngrams = []
-    for t in texts:
-        toks = t.strip().split()
-        ngrams.extend([" ".join(toks[i:i+n]) for i in range(0, max(0, len(toks)-n+1))])
-    denom = max(1, len(ngrams))
-    return len(set(ngrams)) / denom
 
-def self_bleu(texts: List[str], sample: int = 100) -> float:
-    """Approx self-BLEU by sampling; lower is better (more diverse)."""
+def distinct_n(texts: List[str], n: int = 2) -> float:
+    """Calculate Distinct-n metric for n-gram diversity"""
+    if not texts:
+        return 0.0
+    
+    ngrams_list = []
+    for text in texts:
+        tokens = text.strip().split()
+        if len(tokens) >= n:
+            text_ngrams = [" ".join(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
+            ngrams_list.extend(text_ngrams)
+    
+    if not ngrams_list:
+        return 0.0
+    
+    unique_ngrams = set(ngrams_list)
+    return len(unique_ngrams) / len(ngrams_list)
+
+
+def self_bleu(texts: List[str], sample: int = 100, weights: tuple = (0.25, 0.25, 0.25, 0.25)) -> float:
+    """
+    Calculate Self-BLEU score for diversity measurement.
+    Lower scores indicate higher diversity.
+    """
+    if len(texts) <= 1:
+        return 0.0
+    
     try:
         from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
     except Exception as e:
         raise ImportError("self_bleu requires nltk. Install: pip install nltk") from e
+    
     import random
     rng = random.Random(1337)
-    if len(texts) <= 1:
-        return 0.0
-    sample = min(sample, len(texts)-1)
+    
+    # Sample texts if too many
+    sample = min(sample, len(texts))
+    sampled_texts = rng.sample(texts, sample) if len(texts) > sample else texts
+    
     scores = []
-    ref_pool = texts[:]
-    for _ in range(sample):
-        hyp = rng.choice(texts)
-        refs = [rng.choice(ref_pool).split() for _ in range(5)]
-        score = sentence_bleu(refs, hyp.split(), smoothing_function=SmoothingFunction().method1)
-        scores.append(score)
-    return sum(scores)/len(scores)
+    smoothing = SmoothingFunction().method1
+    
+    for i, text in enumerate(sampled_texts):
+        # Use other texts as references
+        references = [t.split() for j, t in enumerate(sampled_texts) if j != i]
+        hypothesis = text.split()
+        
+        if references and hypothesis:
+            try:
+                # Limit number of references for efficiency
+                if len(references) > 10:
+                    references = rng.sample(references, 10)
+                
+                score = sentence_bleu(references, hypothesis, 
+                                    weights=weights,
+                                    smoothing_function=smoothing)
+                scores.append(score)
+            except:
+                continue
+    
+    return sum(scores) / len(scores) if scores else 0.0
 
-def summarize_quality(texts: List[str], compute_dc: bool = False) -> Dict[str, float]:
-    out = {
-        "distinct_2": distinct_n(texts, 2),
-        "distinct_3": distinct_n(texts, 3),
+
+def rouge_l_diversity(texts: List[str], sample_size: int = 100) -> Dict[str, float]:
+    """
+    Calculate ROUGE-L based diversity metrics
+    Returns average ROUGE-L scores between text pairs
+    """
+    if len(texts) < 2:
+        return {'rouge_l_precision': 0.0, 'rouge_l_recall': 0.0, 'rouge_l_f1': 0.0}
+    
+    # Sample texts for efficiency
+    if len(texts) > sample_size:
+        sampled_texts = np.random.choice(texts, sample_size, replace=False)
+    else:
+        sampled_texts = texts
+    
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+    
+    # Compare each text with a few others
+    n_comparisons = min(10, len(sampled_texts) - 1)
+    
+    for i, text1 in enumerate(sampled_texts):
+        # Select comparison texts
+        other_indices = [j for j in range(len(sampled_texts)) if j != i]
+        comparison_indices = np.random.choice(other_indices, 
+                                            min(n_comparisons, len(other_indices)), 
+                                            replace=False)
+        
+        for j in comparison_indices:
+            text2 = sampled_texts[j]
+            scores = scorer.score(text1, text2)
+            rouge_l = scores['rougeL']
+            
+            precision_scores.append(rouge_l.precision)
+            recall_scores.append(rouge_l.recall)
+            f1_scores.append(rouge_l.fmeasure)
+    
+    return {
+        'rouge_l_precision': np.mean(precision_scores) if precision_scores else 0.0,
+        'rouge_l_recall': np.mean(recall_scores) if recall_scores else 0.0,
+        'rouge_l_f1': np.mean(f1_scores) if f1_scores else 0.0
     }
+
+
+def kmeans_inertia_diversity(embeddings: np.ndarray, n_clusters: int = None) -> Dict[str, float]:
+    """
+    Calculate K-means inertia for cluster dispersion analysis
+    Higher inertia indicates more dispersed (diverse) data
+    """
+    if embeddings.shape[0] < 2:
+        return {'kmeans_inertia': 0.0, 'inertia_per_sample': 0.0, 'n_clusters_used': 0}
+    
+    if n_clusters is None:
+        n_clusters = min(max(2, int(np.sqrt(embeddings.shape[0]))), embeddings.shape[0])
+    
+    n_clusters = min(n_clusters, embeddings.shape[0])
+    
     try:
-        out["self_bleu"] = self_bleu(texts)
-    except Exception:
-        out["self_bleu"] = float("nan")
-    if compute_dc:
-        try:
-            out["dcscore"] = dcscore(texts)
-        except Exception:
-            out["dcscore"] = float("nan")
-    return out
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        kmeans.fit(embeddings)
+        
+        inertia = kmeans.inertia_
+        inertia_per_sample = inertia / embeddings.shape[0]
+        
+        return {
+            'kmeans_inertia': float(inertia),
+            'inertia_per_sample': float(inertia_per_sample),
+            'n_clusters_used': n_clusters
+        }
+    except Exception as e:
+        logger.warning(f"K-means clustering failed: {e}")
+        return {'kmeans_inertia': 0.0, 'inertia_per_sample': 0.0, 'n_clusters_used': 0}
+
+
+# def summarize_quality(texts: List[str], compute_dc: bool = False) -> Dict[str, float]:
+#     """Enhanced quality summary with additional metrics"""
+#     out = {
+#         "distinct_2": distinct_n(texts, 2),
+#         "distinct_3": distinct_n(texts, 3),
+#         "distinct_4": distinct_n(texts, 4),
+#     }
+    
+#     try:
+#         out["self_bleu"] = self_bleu(texts)
+#     except Exception:
+#         out["self_bleu"] = float("nan")
+    
+#     if compute_dc:
+#         try:
+#             out["dcscore"] = dcscore(texts)
+#         except Exception:
+#             out["dcscore"] = float("nan")
+    
+#     # Add ROUGE-L diversity
+#     try:
+#         rouge_metrics = rouge_l_diversity(texts)
+#         out.update(rouge_metrics)
+#     except Exception:
+#         out.update({'rouge_l_precision': float("nan"), 'rouge_l_recall': float("nan"), 'rouge_l_f1': float("nan")})
+    
+#     return out
 
 
 class TextValidator:
@@ -234,7 +420,7 @@ class TextValidator:
         return results
     
     def calculate_diversity_metrics(self, texts: List[str]) -> Dict[str, float]:
-        """Calculate diversity metrics for text dataset"""
+        """Calculate comprehensive diversity metrics for text dataset"""
         logger.info("Calculating diversity metrics...")
         
         results = {}
@@ -259,64 +445,48 @@ class TextValidator:
         results['avg_length'] = np.mean(lengths)
         results['length_std'] = np.std(lengths)
         
-        # N-gram diversity
-        results.update(self._calculate_ngram_diversity(texts))
+        # Enhanced n-gram diversity (Distinct-n)
+        for n in range(1, 5):
+            results[f'distinct_{n}'] = distinct_n(texts, n)
         
         # Self-BLEU (diversity within generated texts)
-        results['self_bleu'] = self._calculate_self_bleu(texts)
+        results['self_bleu'] = self_bleu(texts)
         
-        logger.info(f"Diversity metrics: {results}")
+        # ROUGE-L diversity
+        rouge_metrics = rouge_l_diversity(texts)
+        results.update(rouge_metrics)
+        
+        # Get embeddings for advanced metrics
+        try:
+            embeddings = self.embedding_model.encode(texts, convert_to_tensor=False)
+            
+            # K-means inertia (cluster dispersion)
+            kmeans_metrics = kmeans_inertia_diversity(embeddings)
+            results.update(kmeans_metrics)
+            
+            # VendiScore
+            vendi_score = vendiscore(embeddings)
+            results['vendi_score'] = vendi_score
+            
+            # DCScore
+            try:
+                results['dc_score'] = dcscore(texts)
+            except Exception as e:
+                logger.warning(f"DCScore calculation failed: {e}")
+                results['dc_score'] = float('nan')
+            
+        except Exception as e:
+            logger.warning(f"Advanced diversity metrics failed: {e}")
+            results.update({
+                'kmeans_inertia': float('nan'),
+                'inertia_per_sample': float('nan'),
+                'n_clusters_used': 0,
+                'vendi_score': float('nan'),
+                'dc_score': float('nan')
+            })
+        
+        logger.info(f"Diversity metrics calculated: {len(results)} metrics")
         return results
-    
-    def _calculate_ngram_diversity(self, texts: List[str], max_n: int = 4) -> Dict[str, float]:
-        """Calculate n-gram diversity metrics"""
-        results = {}
-        
-        for n in range(1, max_n + 1):
-            all_ngrams = []
-            for text in texts:
-                words = text.lower().split()
-                if len(words) >= n:
-                    text_ngrams = list(ngrams(words, n))
-                    all_ngrams.extend(text_ngrams)
-            
-            if all_ngrams:
-                unique_ngrams = set(all_ngrams)
-                results[f'ngram_{n}_diversity'] = len(unique_ngrams) / len(all_ngrams)
-            else:
-                results[f'ngram_{n}_diversity'] = 0.0
-        
-        return results
-    
-    def _calculate_self_bleu(self, texts: List[str], sample_size: int = 100) -> float:
-        """Calculate Self-BLEU score for diversity measurement"""
-        if len(texts) < 2:
-            return 0.0
-        
-        # Sample texts if too many
-        if len(texts) > sample_size:
-            texts = np.random.choice(texts, sample_size, replace=False).tolist()
-        
-        bleu_scores = []
-        smoothing = SmoothingFunction().method1
-        
-        for i, text in enumerate(texts):
-            reference_texts = texts[:i] + texts[i+1:]  # All other texts as references
-            
-            # Tokenize
-            hypothesis = text.lower().split()
-            references = [ref.lower().split() for ref in reference_texts[:10]]  # Limit references
-            
-            if references and hypothesis:
-                try:
-                    bleu_score = sentence_bleu(references, hypothesis, 
-                                             weights=(0.25, 0.25, 0.25, 0.25),
-                                             smoothing_function=smoothing)
-                    bleu_scores.append(bleu_score)
-                except:
-                    continue
-        
-        return np.mean(bleu_scores) if bleu_scores else 0.0
     
     def check_privacy_violations(self, real_texts: List[str], 
                                synthetic_texts: List[str]) -> Dict[str, Any]:
@@ -439,13 +609,21 @@ class TextValidator:
             validation_results['validations']['quality'] = {'error': str(e), 'passed': False}
             validation_results['overall_passed'] = False
         
-        # 2. Diversity metrics
+        # 2. Enhanced diversity metrics
         try:
             diversity_results = self.calculate_diversity_metrics(synthetic_texts)
             
             # Check diversity thresholds
             min_uniqueness = self.thresholds.get('min_uniqueness_ratio', 0.7)
-            diversity_passed = diversity_results['uniqueness_ratio'] >= min_uniqueness
+            min_distinct_2 = self.thresholds.get('min_distinct_2', 0.4)
+            max_self_bleu = self.thresholds.get('max_self_bleu', 0.4)
+            
+            diversity_passed = (
+                diversity_results['uniqueness_ratio'] >= min_uniqueness and
+                diversity_results.get('distinct_2', 0) >= min_distinct_2 and
+                diversity_results.get('self_bleu', 1.0) <= max_self_bleu
+            )
+            
             diversity_results['passed'] = diversity_passed
             
             if not diversity_passed:
@@ -501,43 +679,65 @@ class TextValidator:
         # Log results to MLflow
         self._log_validation_to_mlflow(validation_results)
         
-        # Log to database
-        if hasattr(self, 'metadata_db'):
-            try:
-                # This would need a dataset_id - in practice, you'd pass this in
-                # For now, we'll log the validation results as metadata
-                pass
-            except Exception as e:
-                logger.warning(f"Could not log to database: {str(e)}")
-        
         logger.info(f"Validation completed. Overall passed: {validation_results['overall_passed']}")
         return validation_results
     
     def _log_validation_to_mlflow(self, results: Dict[str, Any]):
-        """Log validation results to MLflow"""
+        """Enhanced MLflow logging with all metrics"""
         try:
-            # # Set experiment name - this will create it if it doesn't exist
-            # mlflow.set_experiment("synthetic-lm-pipeline")
-            
             with mlflow.start_run(run_name=f"validation_{results['dataset_name']}"):
                 # Log basic metrics
                 mlflow.log_param("dataset_name", results['dataset_name'])
                 mlflow.log_param("total_samples", results['total_samples'])
                 mlflow.log_param("overall_passed", results['overall_passed'])
                 
-                # Log detailed metrics
+                # Log detailed metrics for each validation type
                 for validation_type, validation_data in results['validations'].items():
                     if isinstance(validation_data, dict) and 'error' not in validation_data:
-                        # Log numeric metrics
-                        for key, value in validation_data.items():
-                            if isinstance(value, (int, float)) and key != 'passed':
-                                mlflow.log_metric(f"{validation_type}_{key}", value)
                         
                         # Log pass/fail status
                         mlflow.log_param(f"{validation_type}_passed", validation_data.get('passed', False))
+                        
+                        # Log numeric metrics
+                        for key, value in validation_data.items():
+                            if isinstance(value, (int, float)) and not np.isnan(value) and key != 'passed':
+                                mlflow.log_metric(f"{validation_type}_{key}", value)
+                        
+                        # Special handling for diversity metrics
+                        if validation_type == 'diversity':
+                            # Log all distinct-n metrics
+                            for n in range(1, 5):
+                                distinct_key = f'distinct_{n}'
+                                if distinct_key in validation_data:
+                                    mlflow.log_metric(f"distinct_{n}", validation_data[distinct_key])
+                            
+                            # Log ROUGE-L metrics
+                            rouge_metrics = ['rouge_l_precision', 'rouge_l_recall', 'rouge_l_f1']
+                            for metric in rouge_metrics:
+                                if metric in validation_data and not np.isnan(validation_data[metric]):
+                                    mlflow.log_metric(metric, validation_data[metric])
+                            
+                            # Log advanced metrics
+                            advanced_metrics = ['vendi_score', 'dc_score', 'kmeans_inertia', 'inertia_per_sample']
+                            for metric in advanced_metrics:
+                                if metric in validation_data and not np.isnan(validation_data[metric]):
+                                    mlflow.log_metric(metric, validation_data[metric])
                 
                 # Log failed checks
                 mlflow.log_param("failed_checks", ','.join(results['failed_checks']))
+                
+                # Log summary metrics
+                if 'diversity' in results['validations']:
+                    diversity_data = results['validations']['diversity']
+                    if isinstance(diversity_data, dict) and 'error' not in diversity_data:
+                        # Calculate diversity score (composite metric)
+                        diversity_score = (
+                            diversity_data.get('distinct_2', 0) * 0.3 +
+                            diversity_data.get('vendi_score', 0) * 0.3 +
+                            (1 - diversity_data.get('self_bleu', 0)) * 0.2 +  # Inverted since lower is better
+                            diversity_data.get('uniqueness_ratio', 0) * 0.2
+                        )
+                        mlflow.log_metric("diversity_composite_score", diversity_score)
                 
                 logger.info("Validation results logged to MLflow")
                 
@@ -546,13 +746,13 @@ class TextValidator:
     
     def generate_validation_report(self, results: Dict[str, Any], 
                                  output_path: Path = None) -> str:
-        """Generate a human-readable validation report"""
+        """Generate a human-readable validation report with enhanced metrics"""
         
         report_lines = [
             f"# Validation Report for {results['dataset_name']}",
             f"Generated: {results['timestamp']}",
             f"Total Samples: {results['total_samples']}",
-            f"Overall Status: {'✅ PASSED' if results['overall_passed'] else '❌ FAILED'}",
+            f"Overall Status: {' PASSED' if results['overall_passed'] else ' FAILED'}",
             ""
         ]
         
@@ -566,7 +766,7 @@ class TextValidator:
         # Detailed results
         for validation_type, validation_data in results['validations'].items():
             if isinstance(validation_data, dict) and 'error' not in validation_data:
-                status = "✅ PASSED" if validation_data.get('passed', False) else "❌ FAILED"
+                status = " PASSED" if validation_data.get('passed', False) else " FAILED"
                 report_lines.extend([
                     f"## {validation_type.title()} Validation: {status}",
                     ""
@@ -582,10 +782,29 @@ class TextValidator:
                 
                 elif validation_type == 'diversity':
                     report_lines.extend([
+                        "### Basic Diversity Metrics",
                         f"- Uniqueness Ratio: {validation_data.get('uniqueness_ratio', 'N/A'):.3f}",
                         f"- Vocabulary Size: {validation_data.get('vocabulary_size', 'N/A')}",
-                        f"- Self-BLEU Score: {validation_data.get('self_bleu', 'N/A'):.3f}",
                         f"- Average Length: {validation_data.get('avg_length', 'N/A'):.1f}",
+                        "",
+                        "### N-gram Diversity (Distinct-n)",
+                        f"- Distinct-1: {validation_data.get('distinct_1', 'N/A'):.3f}",
+                        f"- Distinct-2: {validation_data.get('distinct_2', 'N/A'):.3f}",
+                        f"- Distinct-3: {validation_data.get('distinct_3', 'N/A'):.3f}",
+                        f"- Distinct-4: {validation_data.get('distinct_4', 'N/A'):.3f}",
+                        "",
+                        "### Lexical Overlap Metrics",
+                        f"- Self-BLEU Score: {validation_data.get('self_bleu', 'N/A'):.3f} (lower is better)",
+                        f"- ROUGE-L Precision: {validation_data.get('rouge_l_precision', 'N/A'):.3f}",
+                        f"- ROUGE-L Recall: {validation_data.get('rouge_l_recall', 'N/A'):.3f}",
+                        f"- ROUGE-L F1: {validation_data.get('rouge_l_f1', 'N/A'):.3f}",
+                        "",
+                        "### Advanced Diversity Metrics",
+                        f"- VendiScore: {validation_data.get('vendi_score', 'N/A'):.3f} (higher is better)",
+                        f"- DC Score: {validation_data.get('dc_score', 'N/A'):.3f}",
+                        f"- K-means Inertia: {validation_data.get('kmeans_inertia', 'N/A'):.3f}",
+                        f"- Inertia per Sample: {validation_data.get('inertia_per_sample', 'N/A'):.3f}",
+                        f"- Clusters Used: {validation_data.get('n_clusters_used', 'N/A')}",
                         ""
                     ])
                 
@@ -601,6 +820,9 @@ class TextValidator:
                     report_lines.extend([
                         f"- Mean Cosine Similarity: {validation_data.get('mean_cosine_similarity', 'N/A'):.3f}",
                         f"- Cross Similarity: {validation_data.get('cross_similarity', 'N/A'):.3f}",
+                        f"- Real Internal Similarity: {validation_data.get('real_internal_similarity', 'N/A'):.3f}",
+                        f"- Synthetic Internal Similarity: {validation_data.get('synthetic_internal_similarity', 'N/A'):.3f}",
+                        f"- Distribution Similarity: {validation_data.get('distribution_similarity', 'N/A'):.3f}",
                         ""
                     ])
             
@@ -705,7 +927,7 @@ class ValidationPipeline:
     
     def _generate_batch_summary(self, results: Dict[str, Dict[str, Any]], 
                               output_dir: Path):
-        """Generate summary report for batch validation"""
+        """Generate enhanced summary report for batch validation"""
         
         summary_lines = [
             "# Batch Validation Summary",
@@ -725,12 +947,50 @@ class ValidationPipeline:
             ""
         ])
         
+        # Aggregate metrics across all datasets
+        all_diversity_metrics = []
+        all_quality_metrics = []
+        
+        for dataset_name, result in results.items():
+            if result.get('overall_passed', False) and 'validations' in result:
+                diversity_data = result['validations'].get('diversity', {})
+                quality_data = result['validations'].get('quality', {})
+                
+                if isinstance(diversity_data, dict) and 'error' not in diversity_data:
+                    all_diversity_metrics.append(diversity_data)
+                
+                if isinstance(quality_data, dict) and 'error' not in quality_data:
+                    all_quality_metrics.append(quality_data)
+        
+        # Calculate aggregate statistics
+        if all_diversity_metrics:
+            summary_lines.extend([
+                "## Aggregate Diversity Metrics (Passed Datasets Only)",
+                f"- Average Distinct-2: {np.mean([d.get('distinct_2', 0) for d in all_diversity_metrics]):.3f}",
+                f"- Average Self-BLEU: {np.mean([d.get('self_bleu', 0) for d in all_diversity_metrics]):.3f}",
+                f"- Average VendiScore: {np.mean([d.get('vendi_score', 0) for d in all_diversity_metrics if not np.isnan(d.get('vendi_score', np.nan))]):.3f}",
+                f"- Average Uniqueness: {np.mean([d.get('uniqueness_ratio', 0) for d in all_diversity_metrics]):.3f}",
+                ""
+            ])
+        
+        if all_quality_metrics:
+            summary_lines.extend([
+                "## Aggregate Quality Metrics (Passed Datasets Only)",
+                f"- Average Perplexity: {np.mean([q.get('average_perplexity', 0) for q in all_quality_metrics]):.2f}",
+                ""
+            ])
+        
         # Individual results
         summary_lines.append("## Individual Results")
         for dataset_name, result in results.items():
             status = "✅" if result.get('overall_passed', False) else "❌"
             total_samples = result.get('total_samples', 'N/A')
-            summary_lines.append(f"- {dataset_name}: {status} ({total_samples} samples)")
+            failed_checks = result.get('failed_checks', [])
+            
+            line = f"- {dataset_name}: {status} ({total_samples} samples)"
+            if failed_checks:
+                line += f" - Failed: {', '.join(failed_checks)}"
+            summary_lines.append(line)
         
         summary_report = "\n".join(summary_lines)
         
@@ -753,7 +1013,7 @@ if __name__ == "__main__":
     
     from src.pipeline_setup import Config, MetadataDB, setup_logging
     
-    parser = argparse.ArgumentParser(description="Run validation pipeline")
+    parser = argparse.ArgumentParser(description="Run enhanced validation pipeline")
     parser.add_argument("--synthetic-data", required=True,
                        help="Path to synthetic dataset file")
     parser.add_argument("--real-data",
@@ -810,6 +1070,16 @@ if __name__ == "__main__":
             
             if results['failed_checks']:
                 print(f"Failed checks: {', '.join(results['failed_checks'])}")
+            
+            # Print key metrics
+            if 'diversity' in results['validations']:
+                div_data = results['validations']['diversity']
+                if isinstance(div_data, dict) and 'error' not in div_data:
+                    print(f"\nKey Diversity Metrics:")
+                    print(f"- Distinct-2: {div_data.get('distinct_2', 'N/A'):.3f}")
+                    print(f"- Self-BLEU: {div_data.get('self_bleu', 'N/A'):.3f}")
+                    print(f"- VendiScore: {div_data.get('vendi_score', 'N/A'):.3f}")
+                    print(f"- Uniqueness: {div_data.get('uniqueness_ratio', 'N/A'):.3f}")
         
     except Exception as e:
         logger.error(f"Validation pipeline failed: {e}")

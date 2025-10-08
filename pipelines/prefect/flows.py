@@ -1,600 +1,3 @@
-# # pipelines/prefect/flows.py
-# """
-# Prefect flows for orchestrating the synthetic data generation pipeline.
-# Includes end-to-end pipeline, scheduled generation, and monitoring flows.
-# """
-
-# import os
-# import json
-# import logging
-# from pathlib import Path
-# from typing import List, Dict, Any, Optional
-# from datetime import datetime, timedelta
-# import pandas as pd
-
-# from prefect import flow, task, get_run_logger
-# from prefect.task_runners import SequentialTaskRunner, ConcurrentTaskRunner
-# from prefect.blocks.system import Secret
-# from prefect.server.schemas.schedules import CronSchedule, IntervalSchedule
-# import mlflow
-
-# # Setup project paths
-# PROJECT_ROOT = Path(__file__).parent.parent.parent
-# import sys
-# sys.path.append(str(PROJECT_ROOT))
-
-# from src.pipeline_setup import Config, MetadataDB, setup_logging
-# from src.ingestion import DataIngestion
-# from src.generator import SyntheticTextGenerator
-# from src.validate import ValidationPipeline
-
-# # Initialize global configuration
-# config = Config()
-# metadata_db = MetadataDB(config.data_dir / "pipeline.db")
-
-# # Prefect tasks
-# @task(name="setup_environment", description="Setup pipeline environment and check dependencies")
-# def setup_environment_task() -> Dict[str, Any]:
-#     """Setup and validate pipeline environment"""
-#     logger = get_run_logger()
-#     logger.info("Setting up pipeline environment...")
-    
-#     try:
-#         # Check required directories
-#         for dir_path in [config.data_dir, config.models_dir, config.logs_dir]:
-#             dir_path.mkdir(exist_ok=True)
-        
-#         # Check MLflow setup
-#         mlflow.set_tracking_uri(f"file://{config.base_dir / 'mlruns'}")
-        
-#         # Test database connection
-#         test_id = metadata_db.log_dataset(
-#             name="test_setup",
-#             version="v1",
-#             type_="test",
-#             size=1,
-#             file_path="/tmp/test",
-#             metadata={"test": True}
-#         )
-        
-#         logger.info(f"Environment setup completed successfully (test DB ID: {test_id})")
-        
-#         return {
-#             "status": "success",
-#             "timestamp": datetime.now().isoformat(),
-#             "config_loaded": True,
-#             "database_connected": True,
-#             "mlflow_ready": True
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Environment setup failed: {str(e)}")
-#         raise
-
-# @task(name="data_ingestion", description="Ingest and preprocess training data")
-# def data_ingestion_task(source_type: str = "huggingface",
-#                        source_path: str = "wikitext",
-#                        dataset_name: str = "training_data",
-#                        max_samples: int = 1000) -> Dict[str, Any]:
-#     """Data ingestion task"""
-#     logger = get_run_logger()
-#     logger.info(f"Starting data ingestion for {dataset_name}...")
-    
-#     try:
-#         # Initialize ingestion pipeline
-#         ingestion = DataIngestion(config.model_configs, metadata_db, config.data_dir)
-        
-#         # Run ingestion pipeline
-#         saved_paths = ingestion.run_ingestion_pipeline(
-#             source_type=source_type,
-#             source_path=source_path,
-#             dataset_name=dataset_name,
-#             max_samples=max_samples
-#         )
-        
-#         logger.info(f"Data ingestion completed. Files: {list(saved_paths.keys())}")
-        
-#         return {
-#             "status": "success",
-#             "dataset_name": dataset_name,
-#             "saved_paths": {k: str(v) for k, v in saved_paths.items()},
-#             "total_samples": max_samples,
-#             "splits": list(saved_paths.keys())
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Data ingestion failed: {str(e)}")
-#         raise
-
-# @task(name="model_training", description="Fine-tune model with LoRA")
-# def model_training_task(training_data_path: str,
-#                        validation_data_path: Optional[str] = None,
-#                        experiment_name: str = "prefect_training") -> Dict[str, Any]:
-#     """Model training task"""
-#     logger = get_run_logger()
-#     logger.info(f"Starting model training for {experiment_name}...")
-    
-#     try:
-#         # Initialize generator
-#         generator = SyntheticTextGenerator(config.model_configs, metadata_db, config.models_dir)
-        
-#         # Load training data
-#         with open(training_data_path, 'r', encoding='utf-8') as f:
-#             train_data = json.load(f)
-#         train_texts = train_data['texts']
-        
-#         # Load validation data if provided
-#         val_texts = None
-#         if validation_data_path and Path(validation_data_path).exists():
-#             with open(validation_data_path, 'r', encoding='utf-8') as f:
-#                 val_data = json.load(f)
-#             val_texts = val_data['texts']
-        
-#         # Fine-tune model
-#         model_path = generator.fine_tune_with_lora(
-#             train_texts=train_texts,
-#             val_texts=val_texts,
-#             experiment_name=experiment_name
-#         )
-        
-#         logger.info(f"Model training completed. Saved to: {model_path}")
-        
-#         return {
-#             "status": "success",
-#             "experiment_name": experiment_name,
-#             "model_path": model_path,
-#             "training_samples": len(train_texts),
-#             "validation_samples": len(val_texts) if val_texts else 0
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Model training failed: {str(e)}")
-#         raise
-
-# @task(name="synthetic_generation", description="Generate synthetic dataset")
-# def synthetic_generation_task(model_path: Optional[str] = None,
-#                              num_samples: int = 500,
-#                              dataset_name: str = "synthetic_batch") -> Dict[str, Any]:
-#     """Synthetic data generation task"""
-#     logger = get_run_logger()
-#     logger.info(f"Starting synthetic generation for {dataset_name}...")
-    
-#     try:
-#         # Initialize generator
-#         generator = SyntheticTextGenerator(config.model_configs, metadata_db, config.models_dir)
-        
-#         # Load model
-#         if model_path:
-#             generator.load_finetuned_model(model_path)
-#         else:
-#             generator.load_base_model()
-        
-#         # Generate synthetic dataset
-#         synthetic_texts = generator.generate_dataset(num_samples=num_samples)
-        
-#         # Save dataset
-#         metadata = {
-#             "prefect_flow": "synthetic_generation",
-#             "model_used": model_path or "base_model",
-#             "generation_timestamp": datetime.now().isoformat()
-#         }
-        
-#         saved_path = generator.save_synthetic_dataset(
-#             synthetic_texts,
-#             dataset_name,
-#             metadata=metadata
-#         )
-        
-#         logger.info(f"Synthetic generation completed. Generated {len(synthetic_texts)} samples")
-        
-#         return {
-#             "status": "success",
-#             "dataset_name": dataset_name,
-#             "saved_path": str(saved_path),
-#             "generated_samples": len(synthetic_texts),
-#             "model_used": model_path or "base_model"
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Synthetic generation failed: {str(e)}")
-#         raise
-
-# @task(name="dataset_validation", description="Validate synthetic dataset quality")
-# def dataset_validation_task(synthetic_dataset_path: str,
-#                           real_dataset_path: Optional[str] = None,
-#                           dataset_name: str = "validation") -> Dict[str, Any]:
-#     """Dataset validation task"""
-#     logger = get_run_logger()
-#     logger.info(f"Starting validation for {dataset_name}...")
-    
-#     try:
-#         # Initialize validation pipeline
-#         validation_pipeline = ValidationPipeline(config.model_configs, metadata_db)
-        
-#         # Convert string paths to Path objects
-#         synthetic_path = Path(synthetic_dataset_path)
-#         real_path = Path(real_dataset_path) if real_dataset_path else None
-        
-#         # Create output directory for reports
-#         output_dir = config.base_dir / "reports" / "validation"
-#         output_dir.mkdir(parents=True, exist_ok=True)
-        
-#         # Run validation
-#         results = validation_pipeline.validate_synthetic_dataset(
-#             synthetic_dataset_path=synthetic_path,
-#             real_dataset_path=real_path,
-#             output_dir=output_dir
-#         )
-        
-#         logger.info(f"Validation completed. Overall passed: {results['overall_passed']}")
-        
-#         return {
-#             "status": "success",
-#             "dataset_name": dataset_name,
-#             "overall_passed": results['overall_passed'],
-#             "failed_checks": results['failed_checks'],
-#             "total_samples": results['total_samples'],
-#             "validation_details": results['validations'],
-#             "report_dir": str(output_dir)
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Dataset validation failed: {str(e)}")
-#         raise
-
-# @task(name="quality_monitoring", description="Monitor pipeline quality metrics")
-# def quality_monitoring_task() -> Dict[str, Any]:
-#     """Monitor overall pipeline quality and performance"""
-#     logger = get_run_logger()
-#     logger.info("Running quality monitoring...")
-    
-#     try:
-#         # Query database for recent metrics
-#         import sqlite3
-        
-#         with sqlite3.connect(metadata_db.db_path) as conn:
-#             # Get recent datasets
-#             cursor = conn.cursor()
-#             cursor.execute("""
-#                 SELECT type, COUNT(*) as count, AVG(size) as avg_size
-#                 FROM datasets 
-#                 WHERE created_at > datetime('now', '-7 days')
-#                 GROUP BY type
-#             """)
-#             recent_datasets = {row[0]: {"count": row[1], "avg_size": row[2]} 
-#                              for row in cursor.fetchall()}
-            
-#             # Get validation success rates
-#             cursor.execute("""
-#                 SELECT validation_type, 
-#                        SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) as passed,
-#                        COUNT(*) as total
-#                 FROM validations 
-#                 WHERE created_at > datetime('now', '-7 days')
-#                 GROUP BY validation_type
-#             """)
-#             validation_rates = {}
-#             for row in cursor.fetchall():
-#                 validation_rates[row[0]] = {
-#                     "success_rate": row[1] / row[2] if row[2] > 0 else 0,
-#                     "total_validations": row[2]
-#                 }
-        
-#         # Calculate overall health score
-#         health_score = 1.0
-#         if 'quality' in validation_rates:
-#             health_score *= validation_rates['quality']['success_rate']
-#         if 'privacy' in validation_rates:
-#             health_score *= validation_rates['privacy']['success_rate']
-        
-#         # Create monitoring report
-#         monitoring_report = {
-#             "timestamp": datetime.now().isoformat(),
-#             "recent_datasets": recent_datasets,
-#             "validation_rates": validation_rates,
-#             "health_score": health_score,
-#             "status": "healthy" if health_score > 0.8 else "warning" if health_score > 0.5 else "critical"
-#         }
-        
-#         logger.info(f"Quality monitoring completed. Health score: {health_score:.2f}")
-        
-#         return monitoring_report
-        
-#     except Exception as e:
-#         logger.error(f"Quality monitoring failed: {str(e)}")
-#         raise
-
-# @task(name="cleanup_old_files", description="Clean up old files and artifacts")
-# def cleanup_task(days_to_keep: int = 30) -> Dict[str, Any]:
-#     """Clean up old files and artifacts"""
-#     logger = get_run_logger()
-#     logger.info(f"Cleaning up files older than {days_to_keep} days...")
-    
-#     try:
-#         cleanup_stats = {
-#             "deleted_files": 0,
-#             "freed_space_mb": 0,
-#             "errors": []
-#         }
-        
-#         cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-        
-#         # Clean up temporary files
-#         temp_dirs = [
-#             config.data_dir / "temp",
-#             config.models_dir / "temp",
-#             config.logs_dir / "temp"
-#         ]
-        
-#         for temp_dir in temp_dirs:
-#             if temp_dir.exists():
-#                 for file_path in temp_dir.rglob("*"):
-#                     if file_path.is_file():
-#                         try:
-#                             file_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-#                             if file_time < cutoff_date:
-#                                 file_size = file_path.stat().st_size
-#                                 file_path.unlink()
-#                                 cleanup_stats["deleted_files"] += 1
-#                                 cleanup_stats["freed_space_mb"] += file_size / (1024 * 1024)
-#                         except Exception as e:
-#                             cleanup_stats["errors"].append(str(e))
-        
-#         logger.info(f"Cleanup completed. Deleted {cleanup_stats['deleted_files']} files, "
-#                    f"freed {cleanup_stats['freed_space_mb']:.2f} MB")
-        
-#         return {
-#             "status": "success",
-#             "cleanup_stats": cleanup_stats,
-#             "days_kept": days_to_keep
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Cleanup failed: {str(e)}")
-#         raise
-
-# # Prefect flows
-# @flow(name="End-to-End Pipeline", 
-#       description="Complete synthetic data generation pipeline",
-#       task_runner=SequentialTaskRunner())
-# def end_to_end_pipeline(source_type: str = "huggingface",
-#                        source_path: str = "wikitext", 
-#                        dataset_name: str = "e2e_pipeline",
-#                        max_samples: int = 1000,
-#                        num_synthetic: int = 500,
-#                        run_training: bool = True) -> Dict[str, Any]:
-#     """Complete end-to-end pipeline flow"""
-#     logger = get_run_logger()
-#     logger.info("Starting end-to-end synthetic data pipeline...")
-    
-#     # 1. Setup environment
-#     env_result = setup_environment_task()
-    
-#     # 2. Data ingestion
-#     ingestion_result = data_ingestion_task(
-#         source_type=source_type,
-#         source_path=source_path,
-#         dataset_name=dataset_name,
-#         max_samples=max_samples
-#     )
-    
-#     # 3. Model training (optional)
-#     model_path = None
-#     if run_training:
-#         training_result = model_training_task(
-#             training_data_path=ingestion_result["saved_paths"]["train"],
-#             validation_data_path=ingestion_result["saved_paths"].get("validation"),
-#             experiment_name=f"{dataset_name}_training"
-#         )
-#         model_path = training_result["model_path"]
-    
-#     # 4. Synthetic generation
-#     generation_result = synthetic_generation_task(
-#         model_path=model_path,
-#         num_samples=num_synthetic,
-#         dataset_name=f"{dataset_name}_synthetic"
-#     )
-    
-#     # 5. Validation
-#     validation_result = dataset_validation_task(
-#         synthetic_dataset_path=generation_result["saved_path"],
-#         real_dataset_path=ingestion_result["saved_paths"]["test"],
-#         dataset_name=f"{dataset_name}_validation"
-#     )
-    
-#     # 6. Quality monitoring
-#     monitoring_result = quality_monitoring_task()
-    
-#     # Compile final results
-#     pipeline_result = {
-#         "pipeline_status": "success",
-#         "timestamp": datetime.now().isoformat(),
-#         "dataset_name": dataset_name,
-#         "environment": env_result,
-#         "ingestion": ingestion_result,
-#         "generation": generation_result,
-#         "validation": validation_result,
-#         "monitoring": monitoring_result
-#     }
-    
-#     if run_training:
-#         pipeline_result["training"] = training_result
-    
-#     logger.info(f"End-to-end pipeline completed successfully for {dataset_name}")
-#     return pipeline_result
-
-# @flow(name="Scheduled Generation", 
-#       description="Scheduled synthetic data generation",
-#       task_runner=ConcurrentTaskRunner())
-# def scheduled_generation_flow(num_samples: int = 100,
-#                             dataset_prefix: str = "daily") -> Dict[str, Any]:
-#     """Scheduled flow for regular synthetic data generation"""
-#     logger = get_run_logger()
-#     logger.info(f"Starting scheduled generation of {num_samples} samples...")
-    
-#     # Setup
-#     env_result = setup_environment_task()
-    
-#     # Generate with current timestamp
-#     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-#     dataset_name = f"{dataset_prefix}_{timestamp}"
-    
-#     # Generate synthetic data
-#     generation_result = synthetic_generation_task(
-#         model_path=None,  # Use base model
-#         num_samples=num_samples,
-#         dataset_name=dataset_name
-#     )
-    
-#     # Quick validation
-#     validation_result = dataset_validation_task(
-#         synthetic_dataset_path=generation_result["saved_path"],
-#         dataset_name=f"{dataset_name}_validation"
-#     )
-    
-#     # Monitor quality
-#     monitoring_result = quality_monitoring_task()
-    
-#     return {
-#         "status": "success",
-#         "timestamp": datetime.now().isoformat(),
-#         "generation": generation_result,
-#         "validation": validation_result,
-#         "monitoring": monitoring_result
-#     }
-
-# @flow(name="Model Training Pipeline",
-#       description="Dedicated model training and evaluation pipeline",
-#       task_runner=SequentialTaskRunner())
-# def model_training_pipeline(training_data_path: str,
-#                           validation_data_path: Optional[str] = None,
-#                           experiment_name: str = "training_pipeline") -> Dict[str, Any]:
-#     """Dedicated model training pipeline"""
-#     logger = get_run_logger()
-#     logger.info(f"Starting model training pipeline: {experiment_name}")
-    
-#     # Setup
-#     env_result = setup_environment_task()
-    
-#     # Train model
-#     training_result = model_training_task(
-#         training_data_path=training_data_path,
-#         validation_data_path=validation_data_path,
-#         experiment_name=experiment_name
-#     )
-    
-#     # Test generation with trained model
-#     test_generation_result = synthetic_generation_task(
-#         model_path=training_result["model_path"],
-#         num_samples=50,  # Small test set
-#         dataset_name=f"{experiment_name}_test"
-#     )
-    
-#     # Validate test generation
-#     test_validation_result = dataset_validation_task(
-#         synthetic_dataset_path=test_generation_result["saved_path"],
-#         dataset_name=f"{experiment_name}_test_validation"
-#     )
-    
-#     return {
-#         "status": "success",
-#         "timestamp": datetime.now().isoformat(),
-#         "experiment_name": experiment_name,
-#         "environment": env_result,
-#         "training": training_result,
-#         "test_generation": test_generation_result,
-#         "test_validation": test_validation_result
-#     }
-
-# @flow(name="Monitoring and Maintenance",
-#       description="System monitoring and maintenance flow",
-#       task_runner=ConcurrentTaskRunner())
-# def monitoring_maintenance_flow(cleanup_days: int = 30) -> Dict[str, Any]:
-#     """System monitoring and maintenance flow"""
-#     logger = get_run_logger()
-#     logger.info("Starting monitoring and maintenance flow...")
-    
-#     # Quality monitoring
-#     monitoring_result = quality_monitoring_task()
-    
-#     # Cleanup old files
-#     cleanup_result = cleanup_task(days_to_keep=cleanup_days)
-    
-#     return {
-#         "status": "success",
-#         "timestamp": datetime.now().isoformat(),
-#         "monitoring": monitoring_result,
-#         "cleanup": cleanup_result
-#     }
-
-# # Deployment configurations for scheduled flows
-# def create_scheduled_deployments():
-#     """Create Prefect deployments with schedules"""
-    
-#     # Daily generation at 2 AM
-#     daily_generation_deployment = scheduled_generation_flow.to_deployment(
-#         name="daily-synthetic-generation",
-#         description="Generate synthetic data daily",
-#         schedule=CronSchedule(cron="0 2 * * *", timezone="UTC"),
-#         parameters={"num_samples": 200, "dataset_prefix": "daily"}
-#     )
-    
-#     # Weekly maintenance on Sundays at 3 AM
-#     weekly_maintenance_deployment = monitoring_maintenance_flow.to_deployment(
-#         name="weekly-maintenance",
-#         description="Weekly system maintenance",
-#         schedule=CronSchedule(cron="0 3 * * 0", timezone="UTC"),
-#         parameters={"cleanup_days": 30}
-#     )
-    
-#     return [daily_generation_deployment, weekly_maintenance_deployment]
-
-# # Main execution for testing
-# if __name__ == "__main__":
-#     import argparse
-    
-#     parser = argparse.ArgumentParser(description="Run Prefect pipeline flows")
-#     parser.add_argument("--flow", 
-#                        choices=["e2e", "scheduled", "training", "monitoring"],
-#                        default="e2e",
-#                        help="Flow to run")
-#     parser.add_argument("--dataset-name", default="test_pipeline",
-#                        help="Dataset name")
-#     parser.add_argument("--max-samples", type=int, default=500,
-#                        help="Maximum samples to process")
-#     parser.add_argument("--num-synthetic", type=int, default=100,
-#                        help="Number of synthetic samples to generate")
-#     parser.add_argument("--no-training", action="store_true",
-#                        help="Skip model training in e2e pipeline")
-    
-#     args = parser.parse_args()
-    
-#     # Run selected flow
-#     if args.flow == "e2e":
-#         result = end_to_end_pipeline(
-#             dataset_name=args.dataset_name,
-#             max_samples=args.max_samples,
-#             num_synthetic=args.num_synthetic,
-#             run_training=not args.no_training
-#         )
-#         print(f"✅ End-to-end pipeline completed: {result['pipeline_status']}")
-        
-#     elif args.flow == "scheduled":
-#         result = scheduled_generation_flow(
-#             num_samples=args.num_synthetic,
-#             dataset_prefix=args.dataset_name
-#         )
-#         print(f"✅ Scheduled generation completed: {result['status']}")
-        
-#     elif args.flow == "training":
-#         # This would need training data path - simplified for demo
-#         print("Training pipeline requires training data path. Use the API or modify the script.")
-        
-#     elif args.flow == "monitoring":
-#         result = monitoring_maintenance_flow()
-#         print(f"✅ Monitoring and maintenance completed: {result['status']}")
-#         print(f"Health score: {result['monitoring']['health_score']:.2f}")
-
 
 
 # pipelines/prefect/flows.py
@@ -626,6 +29,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 
 from prefect import flow, task, get_run_logger
+# from prefect.task_runners import ThreadPoolTaskRunner#, RayTaskRunner
 from prefect.task_runners import SequentialTaskRunner, ConcurrentTaskRunner
 from prefect.server.schemas.schedules import CronSchedule
 import mlflow
@@ -661,20 +65,40 @@ DATASET_LABELS: Dict[str, Dict[int, str]] = {
     },
 }
 
+# AG_ZERO_TMPL = (
+#     "You are a news editor. Write a concise news summary for the category: {label_name}.\n"
+#     "- Keep it factual and varied.\n"
+#     "- Include plausible named entities.\n"
+#     "Length: 40-80 words.\n"
+#     "\n### Task:\nWrite one {label_name} news summary."
+# )
+
+# IMDB_ZERO_TMPL = (
+#     "You are an IMDB movie reviewer. Write a concise {label_name} review.\n"
+#     "- Keep it natural and varied.\n"
+#     "- Avoid explicit content.\n"
+#     "Length: 60-120 words.\n"
+#     "\n### Task:\nWrite one {label_name} movie review."
+# )
+
+
 AG_ZERO_TMPL = (
-    "You are a news editor. Write a concise news summary for the category: {label_name}.\n"
-    "- Keep it factual and varied.\n"
-    "- Include plausible named entities.\n"
-    "Length: 40-80 words.\n"
-    "\n### Task:\nWrite one {label_name} news summary."
+    "Now you are a journalist writing news articles. You are given a topic and must write a "
+    "corresponding news article for it. You are also given a length requirement. You must "
+    "ensure your news meets the length requirement.\n\n"
+    "Can you write a news report with the topic {label_name}? The length requirement is: "
+    "50 words. Please be creative and write unique news articles."
 )
 
 IMDB_ZERO_TMPL = (
-    "You are an IMDB movie reviewer. Write a concise {label_name} review.\n"
-    "- Keep it natural and varied.\n"
-    "- Avoid explicit content.\n"
-    "Length: 60-120 words.\n"
-    "\n### Task:\nWrite one {label_name} movie review."
+    "Now you are a movie critic. You need to have delicate emotions, unique perspectives, "
+    "and a distinctive style. You are going to write a highly polar review for a movie and "
+    "post it on IMDB. You are given a movie genre/style and a length requirement. You must "
+    "come up with a movie that corresponds to the genre/style and write a review that meets "
+    "the length requirement.\n\n"
+    "Write a film review for a drama movie to express {label_name} feedback. Each review "
+    "should have 80 words. Be sure to express your personal insights and feelings. "
+    "Please be creative and write unique movie reviews."
 )
 
 
@@ -865,6 +289,7 @@ def data_ingestion_task(
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
+    format_for_instruction_tuning=True,
 ) -> Dict[str, Any]:
     logger = get_run_logger()
     logger.info(f"Ingesting data: {dataset_name} ({source_type}:{source_path})")
@@ -879,6 +304,7 @@ def data_ingestion_task(
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             test_ratio=test_ratio,
+            format_for_instruction_tuning=format_for_instruction_tuning,
         )
         return {
             "status": "success",
@@ -1021,7 +447,7 @@ def synthetic_generation_task(
 
         # Load model (finetuned adapter or base)
         if model_path:
-            gen.load_finetuned_model(model_path)
+            gen.load_finetuned_model(model_path, base_model_name=base_model_name)
             model_used = model_path
         else:
             gen.load_base_model(base_model_name) if base_model_name else gen.load_base_model()
@@ -1225,24 +651,25 @@ def cleanup_task(days_to_keep: int = 30) -> Dict[str, Any]:
     name="End-to-End Pipeline",
     description="Ingest -> (optional LoRA finetune) -> generate -> validate",
     task_runner=SequentialTaskRunner(),
+    # task_runner=ThreadPoolTaskRunner(max_workers=4)
 )
+
 def end_to_end_pipeline(
     # environment
     mlflow_uri: Optional[str] = None,
     log_level: str = "INFO",
     seed: Optional[int] = 42,
     # ingestion
-    dataset_kind: str = "ag_news",      # NEW: "ag_news" | "imdb"
-    source_type: str = "huggingface",
-    source_path: Optional[str] = None,  # if None, auto from dataset_kind
-    dataset_name: str = "e2e_pipeline",
+    dataset_kind: str = "ag_news",      # "ag_news" | "imdb"
+    source_type: str = "huggingface",   # "huggingface" | "file"
+    source_path: Optional[str] = None,  # if None and HF, auto = dataset_name
     version: str = "v1",
     max_samples: int = 1000,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     # training
-    training_method: str = "none",  # "lora" or "none"
+    training_method: str = "none",
     base_model_name: Optional[str] = None,
     experiment_name: str = "e2e_training",
     lora_r: Optional[int] = None,
@@ -1251,14 +678,14 @@ def end_to_end_pipeline(
     lora_target_modules: Optional[List[str]] = None,
     # prompts (dataset-aware)
     prompt_mode: str = "zero",  # "zero" | "one" | "few"
-    base_prompt: Optional[str] = None,   # override; can include {label_name}
+    base_prompt: Optional[str] = None,
     prompts_file: Optional[str] = None,
     examples_path: Optional[str] = None,
     shots: int = 0,
     example_strategy: str = "head",
     # generation
-    synth_per_label: int = 500,         # NEW: balanced per label
-    num_samples: Optional[int] = None,  # if provided, overrides synth_per_label*labels
+    synth_per_label: int = 500,
+    num_samples: Optional[int] = None,
     temperature: float = 0.8,
     top_k: int = 50,
     top_p: float = 0.95,
@@ -1271,17 +698,19 @@ def end_to_end_pipeline(
 
     env = setup_environment_task(mlflow_uri=mlflow_uri, log_level=log_level)
 
-    # pick correct HF dataset id
-    src_path = source_path or dataset_kind
+    # Resolve HF id if needed
+    resolved_source_path = source_path or (dataset_kind if source_type == "huggingface" else source_path)
+
     ingest = data_ingestion_task(
         source_type=source_type,
-        source_path=src_path,
-        dataset_name=dataset_name,
+        source_path=resolved_source_path,
+        dataset_name=dataset_kind,
         version=version,
         max_samples=max_samples,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
+        format_for_instruction_tuning=True,
     )
 
     training = model_training_task(
@@ -1299,7 +728,7 @@ def end_to_end_pipeline(
     model_path = training.get("model_path")
 
     prompts_pack = prepare_prompts_task(
-        dataset_kind=dataset_kind,
+        dataset_kind=dataset_kind,  # keep your downstream code dataset-aware
         prompt_mode=prompt_mode,
         base_prompt=base_prompt,
         prompts_file=prompts_file,
@@ -1314,7 +743,7 @@ def end_to_end_pipeline(
         prompts=prompts_pack["prompts"],
         num_samples=num_samples,
         synth_per_label=synth_per_label,
-        dataset_name=f"{dataset_name}_{version}_synthetic",
+        dataset_name=f"{dataset_kind}_{version}_synthetic",
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
@@ -1327,8 +756,8 @@ def end_to_end_pipeline(
     val = dataset_validation_task(
         synthetic_dataset_path=gen["saved_path"],
         real_dataset_path=ingest["saved_paths"].get("test"),
-        dataset_name=f"{dataset_name}_{version}_validation",
-        output_subdir=f"{dataset_name}_{version}",
+        dataset_name=f"{dataset_kind}_{version}_validation",
+        output_subdir=f"{dataset_kind}_{version}",
     )
 
     mon = quality_monitoring_task()
@@ -1346,11 +775,132 @@ def end_to_end_pipeline(
     logger.info("End-to-end pipeline finished.")
     return result
 
+# def end_to_end_pipeline(
+#     # environment
+#     mlflow_uri: Optional[str] = None,
+#     log_level: str = "INFO",
+#     seed: Optional[int] = 42,
+#     # ingestion
+#     dataset_name: str = "ag_news",      # NEW: "ag_news" | "imdb"
+#     source_type: str = "huggingface",
+#     source_path: Optional[str] = None,  # if None, auto from dataset_kind
+#     # dataset_name: str = "e2e_pipeline",
+#     version: str = "v1",
+#     max_samples: int = 1000,
+#     train_ratio: float = 0.8,
+#     val_ratio: float = 0.1,
+#     test_ratio: float = 0.1,
+#     # training
+#     training_method: str = "none",  # "lora" or "none"
+#     base_model_name: Optional[str] = None,
+#     experiment_name: str = "e2e_training",
+#     lora_r: Optional[int] = None,
+#     lora_alpha: Optional[int] = None,
+#     lora_dropout: Optional[float] = None,
+#     lora_target_modules: Optional[List[str]] = None,
+#     # prompts (dataset-aware)
+#     prompt_mode: str = "zero",  # "zero" | "one" | "few"
+#     base_prompt: Optional[str] = None,   # override; can include {label_name}
+#     prompts_file: Optional[str] = None,
+#     examples_path: Optional[str] = None,
+#     shots: int = 0,
+#     example_strategy: str = "head",
+#     # generation
+#     synth_per_label: int = 500,         # NEW: balanced per label
+#     num_samples: Optional[int] = None,  # if provided, overrides synth_per_label*labels
+#     temperature: float = 0.8,
+#     top_k: int = 50,
+#     top_p: float = 0.95,
+#     repetition_penalty: float = 1.0,
+#     max_length: int = 256,
+#     num_return_sequences: int = 1,
+# ) -> Dict[str, Any]:
+#     logger = get_run_logger()
+#     _set_global_seed(seed)
+
+#     env = setup_environment_task(mlflow_uri=mlflow_uri, log_level=log_level)
+
+#     # pick correct HF dataset id
+#     src_path = source_path or dataset_kind
+#     ingest = data_ingestion_task(
+#         source_type=source_type,
+#         source_path=src_path,
+#         dataset_name=dataset_name,
+#         version=version,
+#         max_samples=max_samples,
+#         train_ratio=train_ratio,
+#         val_ratio=val_ratio,
+#         test_ratio=test_ratio,
+#     )
+
+#     training = model_training_task(
+#         training_method=training_method,
+#         training_data_path=ingest["saved_paths"].get("train"),
+#         validation_data_path=ingest["saved_paths"].get("validation"),
+#         base_model_name=base_model_name,
+#         experiment_name=experiment_name,
+#         seed=seed,
+#         lora_r=lora_r,
+#         lora_alpha=lora_alpha,
+#         lora_dropout=lora_dropout,
+#         lora_target_modules=lora_target_modules,
+#     )
+#     model_path = training.get("model_path")
+
+#     prompts_pack = prepare_prompts_task(
+#         dataset_kind=dataset_kind,
+#         prompt_mode=prompt_mode,
+#         base_prompt=base_prompt,
+#         prompts_file=prompts_file,
+#         examples_path=examples_path,
+#         shots=shots,
+#         example_strategy=example_strategy,
+#     )
+
+#     gen = synthetic_generation_task(
+#         model_path=model_path,
+#         base_model_name=base_model_name,
+#         prompts=prompts_pack["prompts"],
+#         num_samples=num_samples,
+#         synth_per_label=synth_per_label,
+#         dataset_name=f"{dataset_name}_{version}_synthetic",
+#         temperature=temperature,
+#         top_k=top_k,
+#         top_p=top_p,
+#         repetition_penalty=repetition_penalty,
+#         max_length=max_length,
+#         num_return_sequences=num_return_sequences,
+#         seed=seed,
+#     )
+
+#     val = dataset_validation_task(
+#         synthetic_dataset_path=gen["saved_path"],
+#         real_dataset_path=ingest["saved_paths"].get("test"),
+#         dataset_name=f"{dataset_name}_{version}_validation",
+#         output_subdir=f"{dataset_name}_{version}",
+#     )
+
+#     mon = quality_monitoring_task()
+
+#     result = {
+#         "status": "success",
+#         "timestamp": datetime.now().isoformat(),
+#         "environment": env,
+#         "ingestion": ingest,
+#         "training": training,
+#         "generation": gen,
+#         "validation": val,
+#         "monitoring": mon,
+#     }
+#     logger.info("End-to-end pipeline finished.")
+#     return result
+
 
 @flow(
     name="Scheduled Generation",
     description="Regular synthetic data generation using base model or a provided finetuned model",
     task_runner=ConcurrentTaskRunner(),
+    # task_runner=ThreadPoolTaskRunner(max_workers=4)
 )
 def scheduled_generation_flow(
     mlflow_uri: Optional[str] = None,
@@ -1431,6 +981,7 @@ def scheduled_generation_flow(
     name="Model Training Pipeline",
     description="Standalone training (LoRA) + quick smoke generation/validation",
     task_runner=SequentialTaskRunner(),
+    # task_runner=ThreadPoolTaskRunner(max_workers=4)
 )
 def model_training_pipeline(
     mlflow_uri: Optional[str] = None,
@@ -1493,6 +1044,7 @@ def model_training_pipeline(
     name="Monitoring and Maintenance",
     description="Quality monitoring and cleanup",
     task_runner=ConcurrentTaskRunner(),
+    # task_runner=ThreadPoolTaskRunner(max_workers=4)
 )
 def monitoring_maintenance_flow(cleanup_days: int = 30) -> Dict[str, Any]:
     mon = quality_monitoring_task()
@@ -1581,9 +1133,9 @@ if __name__ == "__main__":
     sch.add_argument("--model-path")
     sch.add_argument("--prompt-mode", choices=["zero", "one", "few"], default="zero")
     sch.add_argument("--base-prompt")
+    sch.add_argument("--shots", type=int, default=0)
     sch.add_argument("--prompts-file")
     sch.add_argument("--examples-path")
-    sch.add_argument("--shots", type=int, default=0)
     sch.add_argument("--example-strategy", choices=["head", "random"], default="head")
     sch.add_argument("--synth-per-label", type=int, default=200)
     sch.add_argument("--num-samples", type=int)
@@ -1625,7 +1177,7 @@ if __name__ == "__main__":
             dataset_kind=args.dataset_kind,
             source_type=args.source_type,
             source_path=args.source_path,
-            dataset_name=args.dataset_name,
+            # dataset_name=args.dataset_kind,
             version=args.version,
             max_samples=args.max_samples,
             train_ratio=args.train_ratio,
