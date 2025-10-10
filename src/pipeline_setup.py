@@ -23,7 +23,7 @@ class LoRAConfig:
 
 @dataclass
 class GenConfig:
-    model_name: str = "meta-llama/Llama-3.2-3B"
+    model_name: str = "meta-llama/Llama-3.2-3B" #"meta-llama/Llama-2-7b-hf" #"meta-llama/Llama-3.2-3B" 
     device: str = "auto"
     max_new_tokens: int = 128
     temperature: float = 0.8   # τ_g in the papers

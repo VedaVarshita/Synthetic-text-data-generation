@@ -122,7 +122,7 @@ def _set_global_seed(seed: Optional[int]) -> None:
         pass
 
 
-def _maybe_set_mlflow_tracking(uri: Optional[str]) -> None:
+def _set_mlflow_tracking(uri: Optional[str]) -> None:
     if uri:
         mlflow.set_tracking_uri(uri)
     elif not mlflow.get_tracking_uri():
